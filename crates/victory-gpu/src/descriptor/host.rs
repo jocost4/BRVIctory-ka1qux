@@ -2508,12 +2508,10 @@ impl HostHeap {
             COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
-        let n = record.len();
-        // Never 0, which is "never looked at". (A multiply-and-fold over
-        // the record's words: BLAKE3 here was most of the 35 to 42 ms a
-        // frame this pass took over some 250,000 to 300,000 records, run
-        // 200.)
-        let print = record_print(record) | 1;
+        // A slot never looked at that holds nothing: as it was, without
+        // computing a fingerprint.
+        let is_zero = record_is_zero(record);
+        let print = if is_zero { 0 } else { record_print(record) | 1 };
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             if copied.is_empty() {
@@ -2522,13 +2520,23 @@ impl HostHeap {
             let Some(last) = copied.get_mut(index as usize) else {
                 return false;
             };
-            // A slot never looked at that holds nothing: as it was.
-            if *last == print || (*last == 0 && record[..n].iter().all(|&b| b == 0)) {
+            if *last == 0 && is_zero {
+                return false;
+            }
+            let print = if is_zero { record_print(record) | 1 } else { print };
+            if *last == print {
                 return false;
             }
             *last = print;
         }
-        self.mirror_as(index, handle, false, sync_makes());
+        match record_header(record) {
+            Some(raw) => {
+                self.mirror_record(index, handle, raw, false, sync_makes());
+            }
+            None => {
+                self.mirror_as(index, handle, false, sync_makes());
+            }
+        }
         true
     }
 
@@ -2556,7 +2564,7 @@ impl HostHeap {
     ) -> (u64, u64) {
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
-        let mut due: Vec<(u32, u64)> = Vec::new();
+        let mut due: Vec<(u32, u64, Option<[u32; 3]>)> = Vec::new();
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             if copied.is_empty() {
@@ -2577,11 +2585,14 @@ impl HostHeap {
                 let Some(last) = copied.get_mut(index as usize) else {
                     continue;
                 };
+                // A slot never looked at that holds nothing: skip before
+                // computing the multiplicative fingerprint.
+                if *last == 0 && record_is_zero(record) {
+                    continue;
+                }
                 // Never 0, which is "never looked at".
                 let print = record_print(record) | 1;
-                // The record last seen, or a slot never looked at that
-                // holds nothing: as it was.
-                if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
+                if *last == print {
                     continue;
                 }
                 // A table's slot lately: left to its draws, and looked at
@@ -2591,13 +2602,31 @@ impl HostHeap {
                     continue;
                 }
                 *last = print;
-                due.push((index as u32, handle));
+                due.push((index as u32, handle, record_header(record)));
             }
         }
-        for &(index, handle) in &due {
-            self.mirror_as(index, handle, false, sync_makes());
+        let mirrored = due.len() as u64;
+        if !due.is_empty() {
+            // Fast-path filter under one lock: non-view records targeting
+            // slots that are already null do nothing in `mirror_record` when
+            // `for_draw` is false, so skip per-slot lock acquisition for them.
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            due.retain(|&(index, _, raw)| {
+                !matches!(raw, Some([tag, _, _]) if tag != VIEW_TAG && made[index as usize] == 0)
+            });
         }
-        (looked, due.len() as u64)
+        let makes = sync_makes();
+        for &(index, handle, raw) in &due {
+            match raw {
+                Some(raw) => {
+                    self.mirror_record(index, handle, raw, false, makes);
+                }
+                None => {
+                    self.mirror_as(index, handle, false, makes);
+                }
+            }
+        }
+        (looked, mirrored)
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -2628,7 +2657,20 @@ impl HostHeap {
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let raw = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        self.mirror_record(index, handle, raw, for_draw, make_buffers)
+    }
+
+    /// Like [`HostHeap::mirror_as`], using the `[tag, i, generation]` words
+    /// already read from the descriptor record.
+    fn mirror_record(
+        &self,
+        index: u32,
+        handle: u64,
+        [tag, i, generation]: [u32; 3],
+        for_draw: bool,
+        make_buffers: bool,
+    ) -> Option<View> {
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -3172,6 +3214,31 @@ fn sync_tables() -> bool {
 /// Since the last frame line: slots on changed heap pages that
 /// [`HostHeap::mirror_copied`] left to their draws (tables' slots).
 pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Returns whether every byte of `record` is zero, checking 8 bytes at a time
+/// via bitwise OR so untouched zero slots skip fingerprinting.
+fn record_is_zero(record: &[u8]) -> bool {
+    let mut nz = 0u64;
+    let mut words = record.chunks_exact(8);
+    for word in &mut words {
+        nz |= u64::from_ne_bytes(word.try_into().unwrap_or([0; 8]));
+    }
+    for &b in words.remainder() {
+        nz |= u64::from(b);
+    }
+    nz == 0
+}
+
+/// Parses the `[tag, index, generation]` header from an already-copied
+/// descriptor record without re-reading title memory.
+fn record_header(record: &[u8]) -> Option<[u32; 3]> {
+    let head = record.get(..12)?;
+    Some([
+        u32::from_le_bytes(head[0..4].try_into().ok()?),
+        u32::from_le_bytes(head[4..8].try_into().ok()?),
+        u32::from_le_bytes(head[8..12].try_into().ok()?),
+    ])
+}
 
 /// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
 /// equal records give equal prints, and two different records the same
@@ -4344,6 +4411,32 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_is_zero_handles_aligned_and_tail_bytes() {
+        assert!(record_is_zero(&[]));
+        assert!(record_is_zero(&[0u8; 16]));
+        assert!(record_is_zero(&[0u8; 32]));
+        assert!(record_is_zero(&[0u8; 29]));
+        for pos in [0, 7, 8, 15, 23, 28, 31] {
+            let mut buf = [0u8; 32];
+            buf[pos] = 1;
+            assert!(!record_is_zero(&buf), "nonzero at {pos}");
+        }
+        let mut tail = [0u8; 19];
+        tail[18] = 0x80;
+        assert!(!record_is_zero(&tail));
+    }
+
+    #[test]
+    fn record_header_parses_three_le_dwords() {
+        assert_eq!(record_header(&[0u8; 11]), None);
+        let mut rec = [0u8; 32];
+        rec[0..4].copy_from_slice(&VIEW_TAG.to_le_bytes());
+        rec[4..8].copy_from_slice(&42u32.to_le_bytes());
+        rec[8..12].copy_from_slice(&7u32.to_le_bytes());
+        assert_eq!(record_header(&rec), Some([VIEW_TAG, 42, 7]));
+    }
 
     #[test]
     fn directly_indexed_buffer_ranges_follow_the_heap_lifetime() {

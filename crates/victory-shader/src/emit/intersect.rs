@@ -40,6 +40,20 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// Whether BVH slab and triangle tests use FMA-factored arithmetic
+/// (`VICTORY_BVH_FMA=1`, off by default so `intersect_tests` stay bit-identical
+/// to `crate::bvh`). When enabled, `(b - o) * inv` is computed as
+/// `fma(b, inv, -(o * inv))` with `-(o * inv)` hoisted once per box node,
+/// cutting 18 ALU ops per 4-wide box node and 2 ALU ops per triangle test.
+fn bvh_fma() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_bvh_fma(std::env::var("VICTORY_BVH_FMA").ok().as_deref()))
+}
+
+fn parse_bvh_fma(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1"))
+}
+
 /// Where the instruction's node is.
 #[derive(Clone, Copy)]
 enum NodeAt {
@@ -433,16 +447,31 @@ impl<'a> Lower<'a> {
             self.s.m.f32(f32::INFINITY.to_bits()),
             self.s.m.f32(0),
         );
+        let use_fma = bvh_fma();
+        let neg_origin_inv = use_fma.then(|| {
+            std::array::from_fn::<V, 3, _>(|a| {
+                let prod = self.s.m.bin(c, Bin::Mul, ray.origin[a], inverse[a]);
+                self.s.m.bin(c, Bin::Sub, fzero, prod)
+            })
+        });
         let mut ids = [none; 4];
         let mut distances = [infinity; 4];
         for n in 0..4 {
             let bx = &coords[6 * n..6 * n + 6];
             let (mut near, mut far) = ([fzero; 3], [fzero; 3]);
             for a in 0..3 {
-                let low = self.s.m.bin(c, Bin::Sub, bx[a], ray.origin[a]);
-                let low = self.s.m.bin(c, Bin::Mul, low, inverse[a]);
-                let high = self.s.m.bin(c, Bin::Sub, bx[3 + a], ray.origin[a]);
-                let high = self.s.m.bin(c, Bin::Mul, high, inverse[a]);
+                let (low, high) = if let Some(neg_oi) = neg_origin_inv {
+                    (
+                        self.fmad(bx[a], inverse[a], neg_oi[a]),
+                        self.fmad(bx[3 + a], inverse[a], neg_oi[a]),
+                    )
+                } else {
+                    let low = self.s.m.bin(c, Bin::Sub, bx[a], ray.origin[a]);
+                    let low = self.s.m.bin(c, Bin::Mul, low, inverse[a]);
+                    let high = self.s.m.bin(c, Bin::Sub, bx[3 + a], ray.origin[a]);
+                    let high = self.s.m.bin(c, Bin::Mul, high, inverse[a]);
+                    (low, high)
+                };
                 near[a] = self.binary(36, low, high);
                 far[a] = self.binary(35, low, high);
             }
@@ -596,11 +625,17 @@ impl<'a> Lower<'a> {
         let inside = self.s.m.bin(c, Bin::Xor, outside, on);
         let det = self.s.m.bin(c, Bin::Add, v, w);
         let det = self.s.m.bin(c, Bin::Add, u, det);
-        let t = self.s.m.bin(c, Bin::Mul, u, az);
-        let t2 = self.s.m.bin(c, Bin::Mul, v, bz);
-        let t = self.s.m.bin(c, Bin::Add, t, t2);
-        let t2 = self.s.m.bin(c, Bin::Mul, w, cz);
-        let t = self.s.m.bin(c, Bin::Add, t, t2);
+        let t = if bvh_fma() {
+            let t = self.s.m.bin(c, Bin::Mul, u, az);
+            let t = self.fmad(v, bz, t);
+            self.fmad(w, cz, t)
+        } else {
+            let t = self.s.m.bin(c, Bin::Mul, u, az);
+            let t2 = self.s.m.bin(c, Bin::Mul, v, bz);
+            let t = self.s.m.bin(c, Bin::Add, t, t2);
+            let t2 = self.s.m.bin(c, Bin::Mul, w, cz);
+            self.s.m.bin(c, Bin::Add, t, t2)
+        };
         // The distance is not negative: the numerator has the
         // denominator's sign (or is 0). Ordered compares: a denominator
         // of 0 or a NaN is a miss.
@@ -618,5 +653,19 @@ impl<'a> Lower<'a> {
             let f = self.s.m.select(c, hit, out[n], miss[n]);
             self.as_int(f)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bvh_fma;
+
+    #[test]
+    fn bvh_fma_switch_is_opt_in() {
+        assert!(!parse_bvh_fma(None));
+        assert!(!parse_bvh_fma(Some("")));
+        assert!(!parse_bvh_fma(Some("0")));
+        assert!(parse_bvh_fma(Some("1")));
+        assert!(parse_bvh_fma(Some(" 1 ")));
     }
 }
